@@ -2,7 +2,7 @@
 
 A service that receives transaction webhooks from payment processors (e.g. Razorpay), **acknowledges them immediately with `202 Accepted`**, and processes each transaction **reliably in the background** (30-second simulated external call). Duplicate webhooks are ignored safely, and no transaction is lost if the server crashes or restarts.
 
-- **Live API:** `<add deployed URL here>`
+- **Live API:** https://transaction-webhook-service-mkr4.onrender.com
 - **Stack:** TypeScript · Node.js 22 · Fastify · PostgreSQL (Neon) · `pg`
 - **Language note:** the assessment brief mentions Python; this solution is implemented in TypeScript.
 
