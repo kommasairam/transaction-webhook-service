@@ -4,7 +4,41 @@ A service that receives transaction webhooks from payment processors (e.g. Razor
 
 - **Live API:** https://transaction-webhook-service-mkr4.onrender.com
 - **Stack:** TypeScript · Node.js 22 · Fastify · PostgreSQL (Neon) · `pg`
+- **Hosting:** the API is deployed on **Render**; the database is a managed **Neon** Postgres (Singapore, `ap-southeast-1`).
 - **Language note:** the assessment brief mentions Python; this solution is implemented in TypeScript.
+
+> ⏳ **Heads-up: the first request may be slow.** The API is hosted on Render. Render spins down idle instances on its free tier, so the **first request after a period of inactivity can take up to about a minute** while the service wakes up. Once it is awake, responses are fast (the webhook returns `202` well under 500ms). If the first call looks stuck, just wait for it to finish, or send `GET /` first to warm the service up, then run the tests below.
+
+---
+
+## Quick test for reviewers
+
+Run against the live API (about 1 minute, needs `curl`; works in bash / Git Bash):
+
+```bash
+BASE=https://transaction-webhook-service-mkr4.onrender.com
+ID=txn_review_$(date +%s)          # unique id so the test can be repeated
+H='content-type: application/json'
+BODY="{\"transaction_id\":\"$ID\",\"source_account\":\"acc_user_789\",\"destination_account\":\"acc_merchant_456\",\"amount\":1500,\"currency\":\"INR\"}"
+
+# 1. Health check (also wakes the service if it was asleep)
+curl -s $BASE/
+
+# 2. Send the webhook: expect HTTP 202 and a fast response
+curl -s -i -w "\nTIME: %{time_total}s\n" -X POST $BASE/v1/webhooks/transactions -H "$H" -d "$BODY"
+
+# 3. Send the SAME webhook 3 more times: all 202, still only one transaction
+for i in 1 2 3; do curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/v1/webhooks/transactions -H "$H" -d "$BODY"; done
+
+# 4. Status right away: PROCESSING, processed_at is null
+curl -s $BASE/v1/transactions/$ID
+
+# 5. Status after ~31s: PROCESSED, processed_at is about 30s after created_at
+sleep 31
+curl -s $BASE/v1/transactions/$ID
+```
+
+Expected: step 2 returns `202`, step 3 returns three more `202`s, step 4 returns one object with `"status":"PROCESSING"`, step 5 returns `"status":"PROCESSED"`. More test commands (validation, 404, load) are in [section 8](#8-test-it).
 
 ---
 
@@ -47,6 +81,8 @@ The key idea: **the HTTP request does almost nothing** (validate + one database 
 
 ## 2. API reference
 
+Base URL: `https://transaction-webhook-service-mkr4.onrender.com` (or `http://localhost:3000` locally).
+
 ### `POST /v1/webhooks/transactions`: receive a transaction webhook
 
 Request body (all fields required):
@@ -61,18 +97,20 @@ Request body (all fields required):
 }
 ```
 
-| Rule | Detail |
+| Field | Rule |
 |---|---|
-| `transaction_id`, `source_account`, `destination_account` | non-empty strings |
-| `amount` | number, greater than 0 |
+| `transaction_id`, `source_account`, `destination_account` | non-empty strings, up to 128 characters |
+| `amount` | number, greater than 0 (numeric strings such as `"100"` are coerced to a number; non-numeric strings are rejected) |
 | `currency` | string of exactly 3 characters |
+
+Unknown extra fields are ignored.
 
 Responses:
 
 | Status | When | Body |
 |---|---|---|
 | `202 Accepted` | Valid webhook, new **or** duplicate | `{"status":"ACCEPTED","transaction_id":"txn_abc123def456"}` |
-| `400 Bad Request` | Missing or invalid fields | Fastify validation error |
+| `400 Bad Request` | Missing or invalid fields | Fastify validation error, e.g. `{"statusCode":400,"code":"FST_ERR_VALIDATION","error":"Bad Request","message":"body must have required property 'currency'"}` |
 
 **Idempotency:** sending the same `transaction_id` any number of times (even concurrently) always returns `202` and results in exactly one transaction and one processing run. The first payload received wins; later payloads with the same id are ignored.
 
@@ -81,6 +119,8 @@ Responses:
 ```json
 { "status": "HEALTHY", "current_time": "2026-11-01T06:30:38.530Z" }
 ```
+
+`current_time` is the server time in ISO-8601 UTC.
 
 ### `GET /v1/transactions/{transaction_id}`: transaction status (for testing)
 
@@ -139,7 +179,7 @@ A partial index on `(status, created_at) WHERE status = 'PROCESSING'` keeps the 
 | **Parallel waits (async sleep)** | Hundreds of in-flight 30-second waits cost almost nothing in Node, so throughput is not limited by the delay. |
 | **Retries with a cap** | Failures release the lock and retry; after `MAX_ATTEMPTS` the row is marked `FAILED` instead of looping forever. |
 | **Graceful shutdown** | On SIGTERM the server stops accepting work and drains in-flight transactions; anything unfinished is recovered via lease expiry. |
-| **Deployed in the same region as the DB** | Keeps database round trips short so responses stay far below 500ms. |
+| **App and database in the same region** | Keeps database round trips short so responses stay far below 500ms. |
 
 ### Reliability: what happens if the server dies mid-processing?
 
@@ -154,7 +194,7 @@ Copy `.env.example` to `.env`. `npm run dev` and `npm start` load it automatical
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | **required** | Postgres connection string (`sslmode=require` for Neon) |
-| `PORT` | `3000` | HTTP port |
+| `PORT` | `3000` | HTTP port (hosting platforms inject this) |
 | `PROCESSING_DELAY_MS` | `30000` | Simulated external API latency |
 | `POLL_INTERVAL_MS` | `1000` | Worker polling interval |
 | `WORKER_CONCURRENCY` | `200` | Max parallel transactions per instance |
@@ -165,7 +205,7 @@ Copy `.env.example` to `.env`. `npm run dev` and `npm start` load it automatical
 
 ## 6. Run locally
 
-Requires Node.js **22.9+** and a Postgres database (a free [Neon](https://neon.tech) project works; Neon has a Singapore region).
+Requires Node.js **22.9+** and a Postgres database (a free [Neon](https://neon.tech) project works).
 
 ```bash
 npm install
@@ -179,31 +219,53 @@ The table is created automatically on startup. A Docker image is also available:
 
 ---
 
-## 7. Test it
+## 7. Deployment
 
-Replace `localhost:3000` with the live URL to test the deployed service.
+| Part | Where | Notes |
+|---|---|---|
+| API + worker | **Render** web service (Node) | Build: `npm install --include=dev; npm run build` · Start: `npm start` |
+| Database | **Neon** Postgres, Singapore (`ap-southeast-1`) | Pooled connection string, `sslmode=require` |
+
+Environment variables set on Render: `DATABASE_URL` and `NODE_VERSION=22`. The database schema is created automatically on first start, so no manual migration step is needed.
+
+**Cold starts:** on Render's free tier an idle instance is spun down and the first request after that can take up to about a minute. This only affects the first call after inactivity. Because the background worker lives in the same process, a transaction received while the service is awake is processed normally.
+
+---
+
+## 8. Test it
+
+Set `BASE` to the live URL, or to `http://localhost:3000` for a local run. The `RUN` suffix keeps ids unique so tests can be repeated.
 
 ```bash
-# 1. Health
-curl localhost:3000/
+BASE=https://transaction-webhook-service-mkr4.onrender.com
+RUN=$(date +%s)
+H='content-type: application/json'
 
-# 2. Single transaction: expect 202
-curl -i -X POST localhost:3000/v1/webhooks/transactions \
-  -H "content-type: application/json" \
-  -d '{"transaction_id":"txn_test_001","source_account":"acc_user_789","destination_account":"acc_merchant_456","amount":1500,"currency":"INR"}'
+# Health
+curl -s $BASE/
 
-# 3. Status right away (PROCESSING), then after ~30s (PROCESSED)
-curl localhost:3000/v1/transactions/txn_test_001
+# Webhook: expect 202
+curl -s -i -w "\nTIME: %{time_total}s\n" -X POST $BASE/v1/webhooks/transactions -H "$H" \
+  -d "{\"transaction_id\":\"txn_${RUN}_a\",\"source_account\":\"acc_user_789\",\"destination_account\":\"acc_merchant_456\",\"amount\":1500,\"currency\":\"INR\"}"
+
+# Status: PROCESSING now, PROCESSED after ~30s
+curl -s $BASE/v1/transactions/txn_${RUN}_a
 sleep 31
-curl localhost:3000/v1/transactions/txn_test_001
+curl -s $BASE/v1/transactions/txn_${RUN}_a
 
-# 4. Duplicates: 5 parallel identical webhooks, all 202, one transaction
-for i in 1 2 3 4 5; do
-  curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:3000/v1/webhooks/transactions \
-    -H "content-type: application/json" \
-    -d '{"transaction_id":"txn_dup_001","source_account":"a","destination_account":"b","amount":100,"currency":"INR"}' &
-done; wait
-curl localhost:3000/v1/transactions/txn_dup_001
+# Duplicates: 10 parallel identical webhooks, all 202, exactly one transaction
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w "%{http_code} " -X POST $BASE/v1/webhooks/transactions -H "$H" \
+    -d "{\"transaction_id\":\"txn_${RUN}_dup\",\"source_account\":\"a\",\"destination_account\":\"b\",\"amount\":100,\"currency\":\"INR\"}" &
+done; wait; echo
+curl -s $BASE/v1/transactions/txn_${RUN}_dup | grep -o transaction_id | wc -l      # expect 1
+
+# Validation: expect 400
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/v1/webhooks/transactions -H "$H" \
+  -d '{"transaction_id":"txn_bad","source_account":"a"}'
+
+# Unknown id: expect 404
+curl -s -w "\n%{http_code}\n" $BASE/v1/transactions/txn_does_not_exist
 ```
 
 ### Automated tests
@@ -216,18 +278,22 @@ DATABASE_URL="postgresql://..." npm test
 
 They cover: health check, `202` and background processing, 10 concurrent duplicates producing one row, 100 parallel webhooks all under 500ms, recovery of an abandoned (expired-lease) row, and validation / `404` handling.
 
-### Results from manual testing
+### Results from manual testing (local server, remote Neon database)
 
 | Check | Result |
 |---|---|
+| Health check | `HEALTHY` with UTC timestamp |
 | Webhook response | `202 Accepted` |
-| Processing time | `PROCESSED` about 31s after creation |
-| 5 parallel duplicates | five `202`s, a single stored transaction |
-| 50 parallel webhooks | every response 0.27s–0.32s from a laptop calling a remote DB |
+| Processing time | `PROCESSED` about 30.6s after creation |
+| Sequential and 10 parallel duplicates | all `202`, a single stored transaction |
+| Duplicate with different data | first payload kept, later one ignored |
+| 50 parallel webhooks | every response 0.27s–0.32s (laptop calling a remote database) |
+| Invalid payloads (missing field, negative amount, bad currency, non-numeric amount) | `400` |
+| Unknown transaction id | `404` |
 
 ---
 
-## 8. Project structure
+## 9. Project structure
 
 ```
 src/
@@ -244,10 +310,11 @@ Dockerfile    Container build
 
 ---
 
-## 9. Known limitations and production upgrades
+## 10. Known limitations and production upgrades
 
 - The worker runs inside the API process. For independent scaling, run it as a separate service (the code already supports multiple instances safely).
 - At high volume, replace DB polling with a managed queue (SQS / Cloud Tasks / RabbitMQ) plus a dead-letter queue.
 - Verify webhook signatures (e.g. Razorpay's `X-Razorpay-Signature`) and add rate limiting before using this with a real processor.
 - The lease is time-based: if processing legitimately takes longer than `LEASE_MS`, it could be attempted twice. The guarded update still keeps the final state to a single processed transaction.
 - A duplicate webhook with *different* field values is ignored; the first payload is kept.
+- Free-tier hosting spins down when idle (see [Deployment](#7-deployment)); an always-on instance removes the cold start.
